@@ -47,6 +47,12 @@ AMOEBA_SCENT_REACH = 1050.0
 PREDATOR_EAT_SECONDS = 3.0
 GENE_LEVELS = 11
 MOVE_ENERGY_PER_PIXEL = 0.025
+
+
+def _population_stress_multiplier(population_count):
+    if population_count <= 5:
+        return 1.0
+    return 1.1 + 0.05 * (population_count - 6)
 MIN_AMOEBA_FOR_PREDATOR = 4
 MIN_REACHABLE_PREY_FOR_PREDATOR = 2
 EGG_HATCH_SECONDS = 10.0
@@ -788,9 +794,11 @@ class Ameba:
     def _speed_scale(self):
         return 0.8 + 0.04 * self.genome[0]
 
-    def update(self, dt, walls, spots, maps, settings, auto_respawn=True):
+    def update(self, dt, walls, spots, maps, settings, auto_respawn=True,
+               population_count=1):
         if self.dead or self.being_eaten:
             return
+        stress_multiplier = _population_stress_multiplier(population_count)
         self.scent_clock += dt
         light_radius, heat_radius, base_speed, satiety_gain, dark_loss, depletion_rate = settings[:6]
         self.speed = self._movement_speed(base_speed)
@@ -823,8 +831,9 @@ class Ameba:
                 self.current_food = None
                 self.currently_feeding = False
         else:
-            self.satiety -= dark_loss * dt
-            self.pending_reward -= dark_loss * dt * 0.1
+            satiety_loss = dark_loss * dt * stress_multiplier
+            self.satiety -= satiety_loss
+            self.pending_reward -= satiety_loss * 0.1
 
         if self.satiety <= 0:
             if auto_respawn:
@@ -884,9 +893,9 @@ class Ameba:
             self.trail.append(self.position.copy())
             self.scent_trail.append((self.position.copy(), self.scent_clock))
         actual_distance = old_position.distance_to(self.position)
-        self.satiety -= actual_distance * MOVE_ENERGY_PER_PIXEL * max(
+        self.satiety -= (actual_distance * MOVE_ENERGY_PER_PIXEL * max(
             0.0, self._speed_scale() - 1.0,
-        )
+        ) * stress_multiplier)
         if self.satiety <= 0:
             self.mark_dead(-100.0)
             return
@@ -1042,7 +1051,9 @@ class Predator(Ameba):
         position = self.position if position is None else position
         return base_potential + 240.0 * self._scent_at(position)
 
-    def update(self, dt, walls, spots, maps, settings, prey_agents):
+    def update(self, dt, walls, spots, maps, settings, prey_agents,
+               population_count=1):
+        stress_multiplier = _population_stress_multiplier(population_count)
         light_radius, heat_radius, base_speed, _, dark_loss, _ = settings[:6]
         self.speed = base_speed * PREDATOR_BASE_SPEED_RATIO * self._speed_scale()
         self.prey_agents = prey_agents
@@ -1052,7 +1063,7 @@ class Predator(Ameba):
             self.scent_blockers = tuple(
                 wall.inflate(self.radius * 2, self.radius * 2) for wall in walls
             )
-        self.satiety -= dark_loss * PREDATOR_HUNGER_DRAIN_RATIO * dt
+        self.satiety -= dark_loss * PREDATOR_HUNGER_DRAIN_RATIO * dt * stress_multiplier
         if self.satiety <= 0:
             if self.eating_prey is not None:
                 self.eating_prey.being_eaten = False
@@ -1116,9 +1127,9 @@ class Predator(Ameba):
             self.trail.append(self.position.copy())
 
         actual_distance = old_position.distance_to(self.position)
-        self.satiety -= actual_distance * MOVE_ENERGY_PER_PIXEL * max(
+        self.satiety -= (actual_distance * MOVE_ENERGY_PER_PIXEL * max(
             0.0, self._speed_scale() - 1.0,
-        )
+        ) * stress_multiplier)
         if self.satiety <= 0:
             self.mark_dead(-100.0)
             return False
@@ -1548,7 +1559,10 @@ def _pretrain_amoeba_episode(agent, walls, spots, maps, shared_settings, stop_ev
     episode_before = agent.episode
     steps_in_episode = 0
     while agent.episode == episode_before and steps_in_episode < 1500 and not stop_event.is_set():
-        agent.update(agent.decision_interval, walls, spots, maps, read_settings(shared_settings))
+        agent.update(
+            agent.decision_interval, walls, spots, maps, read_settings(shared_settings),
+            population_count=1,
+        )
         steps_in_episode += 1
     if agent.episode == episode_before:
         if agent.previous_state is not None:
@@ -1598,11 +1612,17 @@ def _pretrain_predator_episode(predator_template, amoeba_template, walls, spots,
         for prey in tuple(amoebas):
             prey.neighbor_agents = tuple(amoebas)
             laid_before = prey.total_eggs_laid
-            prey.update(prey.decision_interval, walls, spots, maps, settings)
+            prey.update(
+                prey.decision_interval, walls, spots, maps, settings,
+                population_count=sum(not agent.dead for agent in amoebas),
+            )
             for _ in range(prey.total_eggs_laid - laid_before):
                 eggs.append(Egg.from_parent("amoeba", prey.position, prey))
         amoebas[:] = [prey for prey in amoebas if not prey.dead]
-        hunter.update(hunter.decision_interval, walls, spots, maps, settings, amoebas)
+        hunter.update(
+            hunter.decision_interval, walls, spots, maps, settings, amoebas,
+            population_count=1,
+        )
         for egg in tuple(eggs):
             egg.remaining -= hunter.decision_interval
             if egg.remaining <= 0:
@@ -1767,7 +1787,10 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
             amoeba.reproduction_allowed = True
             amoeba.neighbor_agents = tuple(amoebas)
             eggs_before = amoeba.total_eggs_laid
-            amoeba.update(dt, walls, spots, maps, settings, auto_respawn=False)
+            amoeba.update(
+                dt, walls, spots, maps, settings, auto_respawn=False,
+                population_count=sum(not agent.dead for agent in amoebas),
+            )
             for _ in range(amoeba.total_eggs_laid - eggs_before):
                 egg = Egg.from_parent("amoeba", amoeba.position, amoeba)
                 eggs.append(egg)
@@ -1794,7 +1817,10 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
             hunter.reproduction_allowed = True
             kills_before = hunter.total_kills
             living_prey_before = {id(prey): prey for prey in amoebas if not prey.dead}
-            hunter.update(dt, walls, spots, maps, settings, amoebas)
+            hunter.update(
+                dt, walls, spots, maps, settings, amoebas,
+                population_count=sum(not agent.dead for agent in predators),
+            )
             new_kills = hunter.total_kills - kills_before
             if new_kills:
                 logger.kills += new_kills
