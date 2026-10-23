@@ -241,6 +241,97 @@ class NavigationRegressionTests(unittest.TestCase):
         self.assertGreater(full_speed, hungry_speed)
         self.assertGreater(hungry_speed, starving_speed)
 
+    def test_amoeba_avoids_stronger_combined_neighbor_trails_and_crowds(self):
+        center = pygame.Vector2(main.WORLD_WIDTH / 2, main.WORLD_HEIGHT / 2)
+        first = main.Ameba()
+        second = main.Ameba()
+        for neighbor in (first, second):
+            neighbor.position.update(center)
+            neighbor.scent_clock = 0.0
+            neighbor.scent_trail.clear()
+            neighbor.scent_trail.append((center.copy(), 0.0))
+
+        self.agent.position.update(center)
+        self.agent.neighbor_agents = (first,)
+        one_trail = self.agent._neighbor_scent_at(center)
+        one_neighbor_density = self.agent._neighbor_density_at(center)
+        self.agent.neighbor_agents = (first, second)
+
+        self.assertGreater(self.agent._neighbor_scent_at(center), one_trail)
+        self.assertGreater(self.agent._neighbor_density_at(center), one_neighbor_density)
+
+    def test_amoeba_turns_away_from_neighbor_trail(self):
+        class FlatMaps:
+            def light_at(self, point, spots):
+                return 0.0
+
+            def heat_at(self, point, spots):
+                return 0.0
+
+        center = pygame.Vector2(main.WORLD_WIDTH / 2, main.WORLD_HEIGHT / 2)
+        self.agent.position.update(center)
+        self.agent.heading = 0.0
+        self.agent.speed = 140.0
+        self.agent.epsilon = 0.0
+        neighbor = main.Ameba()
+        neighbor.set_start(center + pygame.Vector2(50, 0))
+        self.agent.neighbor_agents = (neighbor,)
+
+        action = self.agent.choose_action((0,) * 8, [], [], FlatMaps(), 100, 260)
+
+        self.assertIn(action, (1, 2))
+
+    def test_predator_is_attracted_to_amoeba_trails_and_clusters(self):
+        predator = main.Predator()
+        prey = main.Ameba()
+        other_prey = main.Ameba()
+        prey.set_start((650, 300))
+        prey.scent_clock = 10.0
+        prey.scent_trail.clear()
+        prey.scent_trail.append((pygame.Vector2(450, 300), 9.0))
+        other_prey.set_start((650, 320))
+        other_prey.scent_trail.clear()
+        other_prey.scent_trail.append((pygame.Vector2(650, 320), 10.0))
+        predator._scent_targets = (prey,)
+        predator.prey_agents = [prey]
+        predator._scent_cache.clear()
+        one_prey_scent = predator._scent_at(pygame.Vector2(650, 300))
+        one_prey_trail_scent = predator._scent_at(pygame.Vector2(450, 300))
+        single_density = predator._prey_density_at(pygame.Vector2(650, 300))
+        predator._scent_targets = (prey, other_prey)
+        predator._scent_cache.clear()
+        clustered_scent = predator._scent_at(pygame.Vector2(650, 300))
+        clustered_density = predator._prey_density_at(pygame.Vector2(650, 300))
+
+        self.assertGreater(one_prey_trail_scent, 0.0)
+        self.assertGreater(clustered_scent, one_prey_scent)
+        self.assertGreater(clustered_density, single_density)
+
+    def test_predator_follows_amoeba_trail_corridor(self):
+        class FlatMaps:
+            def light_at(self, point, spots):
+                return 0.0
+
+            def heat_at(self, point, spots):
+                return 0.0
+
+        predator = main.Predator()
+        center = pygame.Vector2(main.WORLD_WIDTH / 2, main.WORLD_HEIGHT / 2)
+        predator.position.update(center)
+        predator.heading = 0.0
+        predator.speed = 140.0
+        prey = main.Ameba()
+        prey.set_start(center)
+        prey.scent_clock = 1.0
+        prey.scent_trail.clear()
+        prey.scent_trail.append((center.copy(), 1.0))
+        prey.scent_trail.append((center + pygame.Vector2(200, 0), 0.5))
+        predator.prey_agents = [prey]
+
+        action = predator.choose_action((0,) * predator.state_size, [], [], FlatMaps(), 100, 260)
+
+        self.assertEqual(action, 0)
+
     def test_predator_scent_sensor_points_toward_amoeba(self):
         class FlatMaps:
             def light_at(self, point, spots):
@@ -253,7 +344,7 @@ class NavigationRegressionTests(unittest.TestCase):
         predator.heading = 0
         predator.position.update(main.WORLD_WIDTH / 2, main.WORLD_HEIGHT / 2)
         prey = main.Ameba()
-        prey.position.update(predator.position.x + 300, predator.position.y)
+        prey.set_start((predator.position.x + 300, predator.position.y))
         state = predator.sensors([], FlatMaps(), [], 100, 260, [prey])
         self.assertEqual(len(state), 11)
         self.assertEqual(state[8], 1)
@@ -271,12 +362,30 @@ class NavigationRegressionTests(unittest.TestCase):
         center = pygame.Vector2(main.WORLD_WIDTH / 2, main.WORLD_HEIGHT / 2)
         predator.position.update(center)
         prey = main.Ameba()
-        prey.position.update(center - pygame.Vector2(300, 300))
+        prey.set_start(center - pygame.Vector2(300, 300))
         predator.prey_agents = [prey]
 
         action = predator.choose_action((0,) * predator.state_size, [], [], FlatMaps(), 100, 260)
 
         self.assertEqual(action, 1)
+
+    def test_predator_search_without_prey_scent_does_not_sample_food_fields(self):
+        class UnusedMaps:
+            def light_at(self, point, spots):
+                raise AssertionError("predator search should not sample light")
+
+            def heat_at(self, point, spots):
+                raise AssertionError("predator search should not sample heat")
+
+        predator = main.Predator()
+        predator.position.update(main.WORLD_WIDTH / 2, main.WORLD_HEIGHT / 2)
+        predator.epsilon = 0.0
+
+        action = predator.choose_action(
+            (0,) * predator.state_size, [], [], UnusedMaps(), 100, 260,
+        )
+
+        self.assertIn(action, (0, 1, 2))
 
     def test_predator_reduces_scent_priority_for_its_own_trail(self):
         class FlatMaps:
@@ -291,7 +400,7 @@ class NavigationRegressionTests(unittest.TestCase):
         center = pygame.Vector2(main.WORLD_WIDTH / 2, main.WORLD_HEIGHT / 2)
         predator.position.update(center)
         prey = main.Ameba()
-        prey.position.update(center + pygame.Vector2(300, 0))
+        prey.set_start(center + pygame.Vector2(300, 0))
         predator.prey_agents = [prey]
         predator._lookahead_cell = lambda walls, direction, distance: (
             (1, 1) if abs(direction.y) < 0.1 else
@@ -309,7 +418,7 @@ class NavigationRegressionTests(unittest.TestCase):
         predator = main.Predator()
         prey = main.Ameba()
         predator.position.update(200, 200)
-        prey.position.update(800, 200)
+        prey.set_start((800, 200))
         predator.prey_agents = [prey]
 
         strong_scent = predator._scent_at(pygame.Vector2(500, 200))
@@ -338,7 +447,7 @@ class NavigationRegressionTests(unittest.TestCase):
         predator = main.Predator()
         prey = main.Ameba()
         predator.position.update(400, 400)
-        prey.position.update(400, 400)
+        prey.set_start((400, 400))
         predator.kills_since_egg = 2
         settings = (100, 260, 10, 14, 5, 8, 2)
         predator.update(0.14, [], [], FlatMaps(), settings, [prey])
@@ -360,9 +469,9 @@ class NavigationRegressionTests(unittest.TestCase):
         predator = main.Predator()
         predator.position.update(400, 300)
         prey = main.Ameba()
-        prey.position.update(400, 300)
+        prey.set_start((400, 300))
         other_prey = main.Ameba()
-        other_prey.position.update(600, 300)
+        other_prey.set_start((600, 300))
         settings = (100, 260, 10, 14, 5, 8, 2)
         prey_agents = [prey, other_prey]
 
@@ -526,6 +635,32 @@ class NavigationRegressionTests(unittest.TestCase):
         predator.update(0.1, [], [], FlatMaps(), (100, 260, 110, 14, 5, 8, 2), [])
 
         self.assertAlmostEqual(predator.satiety, 99.8)
+
+    def test_predator_runtime_configuration_is_applied(self):
+        class FlatMaps:
+            def light_at(self, point, spots):
+                return 0.2
+
+            def heat_at(self, point, spots):
+                return 0.2
+
+        predator = main.Predator()
+        settings = (*main.SETTING_DEFAULTS[:7], 0.9, 0.6, 600.0, 1.5, 2.0,
+                    4.5, 9.0, 5.0, 400.0, 4.0, 3.0, 2.5, 5.0, 4.0)
+
+        predator.update(0.0, [], [], FlatMaps(), settings, [])
+
+        self.assertAlmostEqual(predator.speed, settings[2] * settings[7] * predator._speed_scale())
+        self.assertEqual(predator.speed_ratio, settings[7])
+        self.assertEqual(predator.hunger_drain_ratio, settings[8])
+        self.assertEqual(predator.scent_reach, settings[9])
+        self.assertEqual(predator.eating_duration, settings[10])
+        self.assertEqual(predator.kills_per_egg, int(settings[11]))
+        self.assertEqual(predator.prey_scent_weight, settings[16])
+        self.assertEqual(predator.prey_trail_weight, settings[17])
+        self.assertEqual(predator.prey_crowding_weight, settings[18])
+        self.assertEqual(predator.predator_trail_avoidance, settings[19])
+        self.assertEqual(predator.predator_crowding_avoidance, settings[20])
 
     def test_hunger_increases_predator_exploration_and_aggression(self):
         predator = main.Predator()

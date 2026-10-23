@@ -146,9 +146,36 @@ SETTING_NAMES = (
     "Потеря сытости в темноте",
     "Расход ценности пятна",
     "Яиц амёбы для зачёта обучения",
+    "Скорость хищника относительно амёбы",
+    "Расход сытости хищника",
+    "Дальность обоняния хищника",
+    "Время поедания амёбы",
+    "Убийств хищника на яйцо",
+    "Избегание собственного следа амёбы",
+    "Избегание следов других амёб",
+    "Избегание скученности амёб",
+    "Дальность обоняния следов амёб",
+    "Притяжение запаха амёб",
+    "Притяжение следов амёб",
+    "Притяжение скоплений амёб",
+    "Избегание следов хищников",
+    "Избегание скученности хищников",
 )
-SETTING_DEFAULTS = (100.0, 260.0, 143.0, 14.0, 3.5, 8.0, 2.0)
-SETTING_RANGES = ((20, 250, 5), (30, 500, 10), (30, 240, 1), (2, 35, 1), (1, 15, 0.5), (1, 25, 1), (1, 20, 1))
+SETTING_DEFAULTS = (
+    100.0, 260.0, 143.0, 14.0, 3.5, 8.0, 2.0,
+    PREDATOR_BASE_SPEED_RATIO, PREDATOR_HUNGER_DRAIN_RATIO,
+    AMOEBA_SCENT_REACH, PREDATOR_EAT_SECONDS, 3.0,
+    4.0, 8.0, 3.0, 320.0, 3.5, 2.0, 2.0, 4.0, 3.0,
+)
+SETTING_RANGES = (
+    (20, 250, 5), (30, 500, 10), (30, 240, 1), (2, 35, 1),
+    (1, 15, 0.5), (1, 25, 1), (1, 20, 1),
+    (0.3, 1.5, 0.05), (0.1, 2.0, 0.05), (200, 1800, 50),
+    (0.5, 8.0, 0.5), (1, 10, 1),
+    (0.0, 12.0, 0.5), (0.0, 20.0, 0.5), (0.0, 10.0, 0.5),
+    (100, 800, 25), (0.0, 10.0, 0.5), (0.0, 10.0, 0.5),
+    (0.0, 10.0, 0.5), (0.0, 12.0, 0.5), (0.0, 10.0, 0.5),
+)
 
 
 class FoodSpot:
@@ -195,38 +222,57 @@ class SensorMaps:
                 distance = math.hypot(x - source.x, y - source.y)
                 if distance >= reach:
                     continue
-                if occluded:
-                    target = (x, y)
-                    if any(wall.clipline(source_line, target) for wall in self.walls):
-                        continue
+                target = (x, y)
+                ray_bounds = pygame.Rect(
+                    min(source_line[0], x), min(source_line[1], y),
+                    abs(x - source_line[0]) + 1, abs(y - source_line[1]) + 1,
+                ).inflate(1, 1)
+                candidates = ray_bounds.collidelistall(self.walls)
+                if any(self.walls[index].clipline(source_line, target)
+                       for index in candidates):
+                    continue
                 strength = (1.0 - distance / reach) ** 2
                 layer[row + gx] = round(255 * strength)
         return layer
 
     @staticmethod
-    def _sample(layer, point):
+    def _sample_coordinates(point):
         gx = max(0.0, min(FIELD_WIDTH - 1.0, point.x / FIELD_CELL - 0.5))
         gy = max(0.0, min(FIELD_HEIGHT - 1.0, point.y / FIELD_CELL - 0.5))
         x0, y0 = int(gx), int(gy)
         x1, y1 = min(x0 + 1, FIELD_WIDTH - 1), min(y0 + 1, FIELD_HEIGHT - 1)
-        fx, fy = gx - x0, gy - y0
-        top_left = layer[y0 * FIELD_WIDTH + x0] / 255.0
-        top_right = layer[y0 * FIELD_WIDTH + x1] / 255.0
-        bottom_left = layer[y1 * FIELD_WIDTH + x0] / 255.0
-        bottom_right = layer[y1 * FIELD_WIDTH + x1] / 255.0
+        return (y0 * FIELD_WIDTH + x0, y0 * FIELD_WIDTH + x1,
+                y1 * FIELD_WIDTH + x0, y1 * FIELD_WIDTH + x1,
+                gx - x0, gy - y0)
+
+    @staticmethod
+    def _sample_at_coordinates(layer, coordinates):
+        top_left_index, top_right_index, bottom_left_index, bottom_right_index, fx, fy = coordinates
+        top_left = layer[top_left_index] / 255.0
+        top_right = layer[top_right_index] / 255.0
+        bottom_left = layer[bottom_left_index] / 255.0
+        bottom_right = layer[bottom_right_index] / 255.0
         top = top_left + (top_right - top_left) * fx
         bottom = bottom_left + (bottom_right - bottom_left) * fx
         return top + (bottom - top) * fy
 
+    @staticmethod
+    def _sample(layer, point):
+        return SensorMaps._sample_at_coordinates(
+            layer, SensorMaps._sample_coordinates(point),
+        )
+
     def light_at(self, point, food_spots):
-        return min(1.0, sum(self._sample(layer, point) * spot.value / 100.0
+        coordinates = self._sample_coordinates(point)
+        return min(1.0, sum(self._sample_at_coordinates(layer, coordinates) * spot.value / 100.0
                             for layer, spot in zip(self.light_layers, food_spots)))
 
     def light_from_spot(self, index, point):
         return self._sample(self.light_layers[index], point)
 
     def heat_at(self, point, food_spots):
-        return max((self._sample(layer, point) * spot.value / 100.0
+        coordinates = self._sample_coordinates(point)
+        return max((self._sample_at_coordinates(layer, coordinates) * spot.value / 100.0
                     for layer, spot in zip(self.heat_layers, food_spots)), default=0.0)
 
     def move_source(self, index, position):
@@ -270,6 +316,10 @@ class Ameba:
         self.defer_training_save = False
         self.state_size = 8
         self.neighbor_agents = ()
+        self.own_trail_avoidance = 4.0
+        self.neighbor_trail_avoidance = 8.0
+        self.crowding_avoidance = 3.0
+        self.neighbor_scent_reach = 320.0
         self.training_state_path = None
         self.shared_training_steps = None
         self.steps = 0
@@ -338,6 +388,12 @@ class Ameba:
         return False
 
     def _gradient_state(self, field_value, sensor_radius):
+        _, _, forward_change, right_change = self._gradient_components(
+            field_value, sensor_radius,
+        )
+        return self._gradient_state_from_components(forward_change, right_change)
+
+    def _gradient_components(self, field_value, sensor_radius):
         forward = pygame.Vector2(math.cos(self.heading), math.sin(self.heading))
         right = pygame.Vector2(-forward.y, forward.x)
         forward_change = field_value(self.position + forward * sensor_radius) - field_value(
@@ -346,6 +402,10 @@ class Ameba:
         right_change = field_value(self.position + right * sensor_radius) - field_value(
             self.position - right * sensor_radius
         )
+        return forward, right, forward_change, right_change
+
+    @staticmethod
+    def _gradient_state_from_components(forward_change, right_change):
         magnitude = math.hypot(forward_change, right_change)
         if magnitude < 0.002:
             direction = 4
@@ -381,7 +441,7 @@ class Ameba:
     def _neighbor_scent_at(self, point):
         intensity = 0.0
         smell_scale = self._smell_scale()
-        reach = 320.0 * smell_scale
+        reach = self.neighbor_scent_reach * smell_scale
         reach_squared = reach * reach
         for neighbor in self.neighbor_agents:
             if neighbor is self or neighbor.dead:
@@ -409,8 +469,17 @@ class Ameba:
                 scent = smell_scale * math.exp(
                     -age / 16.0 - distance / (140.0 * smell_scale)
                 )
-                intensity = max(intensity, scent)
-        return intensity
+                intensity += scent
+        return min(3.0, intensity)
+
+    def _neighbor_density_at(self, point):
+        radius_squared = 220.0 * 220.0
+        count = sum(
+            1 for neighbor in self.neighbor_agents
+            if neighbor is not self and not neighbor.dead
+            and point.distance_squared_to(neighbor.position) <= radius_squared
+        )
+        return min(1.0, count / 3.0)
 
     def _own_trail_scent_at(self, point):
         intensity = 0.0
@@ -422,8 +491,8 @@ class Ameba:
             distance = point.distance_to(trail_position)
             if distance <= 220.0:
                 age = age_steps * self.decision_interval
-                intensity = max(intensity, math.exp(-age / 14.0 - distance / 90.0))
-        return intensity
+                intensity += math.exp(-age / 14.0 - distance / 90.0)
+        return min(3.0, intensity)
 
     def _food_at_position(self, spots, maps):
         choices = []
@@ -586,6 +655,7 @@ class Ameba:
             last_motion.normalize_ip()
         scent_here = self._neighbor_scent_at(self.position)
         own_trail_here = self._own_trail_scent_at(self.position)
+        crowding_here = self._neighbor_density_at(self.position)
         for action, offset in enumerate(action_offsets):
             candidate_heading = self.heading + offset * self.turn_step
             direction = pygame.Vector2(math.cos(candidate_heading), math.sin(candidate_heading))
@@ -596,10 +666,13 @@ class Ameba:
                 maps, spots, light_radius, heat_radius, destination, candidate_heading
             )
             field_guidance = max(-1.0, min(1.0, (potential - current_potential) * 1.5))
-            scent_avoidance = (scent_here - self._neighbor_scent_at(destination)) * 8.0
+            scent_avoidance = (scent_here - self._neighbor_scent_at(destination)) * self.neighbor_trail_avoidance
             scent_avoidance += (
                 own_trail_here - self._own_trail_scent_at(destination)
-            ) * 4.0
+            ) * self.own_trail_avoidance
+            scent_avoidance += (
+                crowding_here - self._neighbor_density_at(destination)
+            ) * self.crowding_avoidance
             route_cell = self._lookahead_cell(walls, direction, max(CELL_SIZE * 5, distance * 3))
             visits = self.visited_cells.get(route_cell, 0)
             revisit_penalty = min(visits, 6) * self._exploration_revisit_weight()
@@ -779,6 +852,8 @@ class Ameba:
         self.scent_clock = 0.0
         self.scent_trail.clear()
         self.scent_trail.append((self.position.copy(), self.scent_clock))
+        self._cached_scent_sources = ()
+        self._cached_scent_clock = None
         self.being_eaten = False
 
     def _movement_speed(self, base_speed):
@@ -803,6 +878,9 @@ class Ameba:
         light_radius, heat_radius, base_speed, satiety_gain, dark_loss, depletion_rate = settings[:6]
         self.speed = self._movement_speed(base_speed)
         self.training_egg_threshold = int(settings[6])
+        if len(settings) > 15:
+            (self.own_trail_avoidance, self.neighbor_trail_avoidance,
+             self.crowding_avoidance, self.neighbor_scent_reach) = settings[12:16]
         self.current_food = self._food_at_position(spots, maps)
         self.currently_feeding = self.current_food is not None
         if self.current_food:
@@ -914,6 +992,16 @@ class Predator(Ameba):
         super().__init__()
         self.state_size = 11
         self.training_egg_threshold = 1
+        self.speed_ratio = PREDATOR_BASE_SPEED_RATIO
+        self.hunger_drain_ratio = PREDATOR_HUNGER_DRAIN_RATIO
+        self.scent_reach = AMOEBA_SCENT_REACH
+        self.eating_duration = PREDATOR_EAT_SECONDS
+        self.kills_per_egg = 3
+        self.prey_scent_weight = 3.5
+        self.prey_trail_weight = 2.0
+        self.prey_crowding_weight = 2.0
+        self.predator_trail_avoidance = 4.0
+        self.predator_crowding_avoidance = 3.0
         self.kills_since_egg = 0
         self.total_kills = 0
         self.prey_agents = []
@@ -923,40 +1011,83 @@ class Predator(Ameba):
         self.scent_walls = []
         self.scent_blockers = ()
         self._scent_cache = {}
+        self._scent_targets = None
+
+    def _scent_blocked(self, point, source_position):
+        if not self.scent_blockers or point.distance_squared_to(source_position) <= 0.0:
+            return False
+        segment_start = (round(point.x), round(point.y))
+        segment_end = (round(source_position.x), round(source_position.y))
+        segment_bounds = pygame.Rect(
+            min(segment_start[0], segment_end[0]),
+            min(segment_start[1], segment_end[1]),
+            max(1, abs(segment_end[0] - segment_start[0])),
+            max(1, abs(segment_end[1] - segment_start[1])),
+        )
+        candidates = segment_bounds.collidelistall(self.scent_blockers)
+        return any(self.scent_blockers[index].clipline(segment_start, segment_end)
+                   for index in candidates)
 
     def _scent_at(self, point):
         cache_key = (point.x, point.y, id(self.scent_blockers))
         if cache_key in self._scent_cache:
             return self._scent_cache[cache_key]
-        living_prey = [prey for prey in self.prey_agents
-                       if not prey.dead and not prey.being_eaten]
+        smell_scale = self._smell_scale()
+        smell_reach = self.scent_reach * smell_scale
+        smell_reach_squared = smell_reach * smell_reach
+        living_prey = self._scent_targets
+        if living_prey is None:
+            living_prey = tuple(prey for prey in self.prey_agents
+                                if not prey.dead and not prey.being_eaten)
         intensity = 0.0
         for prey in living_prey:
-            delta = prey.position - point
-            distance = delta.length()
-            smell_reach = AMOEBA_SCENT_REACH * self._smell_scale()
-            if distance > smell_reach:
-                continue
-            if distance > 0 and self.scent_walls:
-                segment_start = (round(point.x), round(point.y))
-                segment_end = (round(prey.position.x), round(prey.position.y))
-                segment_bounds = pygame.Rect(
-                    min(segment_start[0], segment_end[0]),
-                    min(segment_start[1], segment_end[1]),
-                    max(1, abs(segment_end[0] - segment_start[0])),
-                    max(1, abs(segment_end[1] - segment_start[1])),
-                )
-                candidate_walls = segment_bounds.collidelistall(self.scent_blockers)
-                blocked = any(
-                    self.scent_blockers[index].clipline(segment_start, segment_end)
-                    for index in candidate_walls
-                )
-                if blocked:
+            sources = [(prey.position, 0.0, False)]
+            if prey._cached_scent_clock != prey.scent_clock:
+                trail_sources = []
+                for index, (trail_position, deposited_at) in enumerate(
+                    reversed(prey.scent_trail)
+                ):
+                    if index >= 60:
+                        break
+                    if index % 3:
+                        continue
+                    age = prey.scent_clock - deposited_at
+                    if age > 48.0:
+                        break
+                    trail_sources.append((trail_position, age))
+                prey._cached_scent_sources = tuple(trail_sources)
+                prey._cached_scent_clock = prey.scent_clock
+            sources.extend((trail_position, age, True)
+                           for trail_position, age in prey._cached_scent_sources)
+            for source_position, age, is_trail in sources:
+                delta = source_position - point
+                distance_squared = delta.length_squared()
+                if distance_squared > smell_reach_squared:
                     continue
-            intensity = max(intensity, self._smell_scale()
-                            * math.exp(-3.0 * distance / smell_reach))
+                distance = math.sqrt(distance_squared)
+                if self._scent_blocked(point, source_position):
+                    continue
+                if is_trail:
+                    intensity += (self.prey_trail_weight * smell_scale
+                                  * math.exp(-age / 16.0 - distance / (140.0 * smell_scale)))
+                else:
+                    intensity += smell_scale * math.exp(-3.0 * distance / smell_reach)
+        intensity = min(8.0, intensity)
         self._scent_cache[cache_key] = intensity
         return intensity
+
+    def _prey_density_at(self, point):
+        radius_squared = 220.0 * 220.0
+        prey = self._scent_targets
+        if prey is None:
+            prey = tuple(agent for agent in self.prey_agents
+                         if not agent.dead and not agent.being_eaten)
+        count = sum(
+            1 for agent in prey
+            if point.distance_squared_to(agent.position) <= radius_squared
+            and not self._scent_blocked(point, agent.position)
+        )
+        return min(1.0, count / 3.0)
 
     def _hunger_level(self):
         return max(0.0, min(1.0, 1.0 - self.satiety / 100.0))
@@ -969,16 +1100,17 @@ class Predator(Ameba):
 
     def choose_action(self, state, walls, spots, maps, light_radius, heat_radius):
         scent_here = self._scent_at(self.position)
-        own_trail_here = self._own_trail_scent_at(self.position)
+        predator_trail_here = (self._own_trail_scent_at(self.position)
+                               + self._neighbor_scent_at(self.position))
+        predator_density_here = self._neighbor_density_at(self.position)
+        prey_density_here = self._prey_density_at(self.position)
         if scent_here > 0.01:
-            # Sample the odor field around the predator to estimate a stable
-            # bearing. Comparing only the three immediate actions can make it
-            # repeatedly turn toward tiny scent fluctuations and trace circles.
-            scent_gradient = pygame.Vector2()
+            # Opposite cardinal probes estimate the same bearing with half the
+            # expensive scent and wall-occlusion queries.
             sensor_radius = max(48.0, self.radius * 6.0)
-            for sample in range(8):
-                angle = sample * math.tau / 8
-                direction = pygame.Vector2(math.cos(angle), math.sin(angle))
+            scent_gradient = pygame.Vector2()
+            for dx, dy in ((1, 0), (0, 1), (-1, 0), (0, -1)):
+                direction = pygame.Vector2(dx, dy)
                 scent_gradient += direction * self._scent_at(
                     self.position + direction * sensor_radius
                 )
@@ -996,7 +1128,8 @@ class Predator(Ameba):
                 intercept_direction = predicted_position - self.position
                 if intercept_direction.length_squared() > 1.0:
                     scent_gradient += (
-                        intercept_direction.normalize() * 3.5 * self._aggression_level()
+                        intercept_direction.normalize() * self.prey_scent_weight
+                        * self._aggression_level()
                     )
             if scent_gradient.length_squared() > 1e-8:
                 scent_direction = scent_gradient.normalize()
@@ -1018,12 +1151,22 @@ class Predator(Ameba):
                     revisit_penalty = min(visits, 6) * (1.0 + 1.5 * exploration_drive)
                     novelty_bonus = 0.75 * exploration_drive if visits == 0 else 0.0
                     own_trail_avoidance = (
-                        own_trail_here - self._own_trail_scent_at(
+                        predator_trail_here - self._own_trail_scent_at(
                             self.position + direction * distance,
-                        )
-                    ) * 4.0
-                    score = (3.5 * self._aggression_level() * scent_alignment
+                        ) - self._neighbor_scent_at(self.position + direction * distance)
+                    ) * self.predator_trail_avoidance
+                    prey_density_at_destination = self._prey_density_at(
+                        self.position + direction * distance,
+                    )
+                    predator_density_at_destination = self._neighbor_density_at(
+                        self.position + direction * distance,
+                    )
+                    score = (self.prey_scent_weight * self._aggression_level() * scent_alignment
                              + own_trail_avoidance + novelty_bonus
+                             + (prey_density_at_destination - prey_density_here)
+                             * self.prey_crowding_weight
+                             + (predator_density_here - predator_density_at_destination)
+                             * self.predator_crowding_avoidance
                              - revisit_penalty
                              + 0.2 * values[action] / q_scale - 0.08 * abs(offset))
                     options.append((score, action))
@@ -1031,15 +1174,69 @@ class Predator(Ameba):
                     best_score = max(score for score, _ in options)
                     return random.choice([action for score, action in options
                                           if score == best_score])
-        return super().choose_action(state, walls, spots, maps, light_radius, heat_radius)
+        return self._search_action_without_scent(state, walls)
+
+    def _search_action_without_scent(self, state, walls):
+        values = self.q_table.get(state, (0.0, 0.0, 0.0))
+        q_scale = max(1.0, max(abs(value) for value in values))
+        distance = self.speed * self.decision_interval * 1.5
+        motion = self.position - self.trail[-2] if len(self.trail) > 1 else pygame.Vector2()
+        has_momentum = motion.length_squared() > 1.0
+        if has_momentum:
+            motion.normalize_ip()
+        exploration_drive = self._hunger_level()
+        predator_trail_here = (self._own_trail_scent_at(self.position)
+                               + self._neighbor_scent_at(self.position))
+        predator_density_here = self._neighbor_density_at(self.position)
+        prey_density_here = self._prey_density_at(self.position)
+        options = []
+        for action, offset in enumerate((0, -1, 1)):
+            heading = self.heading + offset * self.turn_step
+            direction = pygame.Vector2(math.cos(heading), math.sin(heading))
+            if not self._path_clear(walls, direction, distance):
+                continue
+            destination = self.position + direction * distance
+            visits = self.visited_cells.get(self._cell_for_position(destination), 0)
+            revisit_penalty = min(visits, 6) * (0.5 + exploration_drive)
+            novelty_bonus = 0.75 * exploration_drive if visits == 0 else 0.0
+            momentum_bonus = 0.25 * direction.dot(motion) if has_momentum else 0.0
+            predator_trail_at_destination = (
+                self._own_trail_scent_at(destination) + self._neighbor_scent_at(destination)
+            )
+            route_score = (novelty_bonus + momentum_bonus
+                           + (self._prey_density_at(destination) - prey_density_here)
+                           * self.prey_crowding_weight
+                           + (predator_trail_here - predator_trail_at_destination)
+                           * self.predator_trail_avoidance
+                           + (predator_density_here - self._neighbor_density_at(destination))
+                           * self.predator_crowding_avoidance
+                           - revisit_penalty
+                           - 0.08 * abs(offset))
+            score = route_score + 0.2 * values[action] / q_scale
+            options.append((visits, score, route_score, action))
+        if not options:
+            return random.randrange(3)
+        fresh_options = [option for option in options if option[0] == 0]
+        if fresh_options:
+            options = fresh_options
+        if random.random() < self.epsilon:
+            best_route_score = max(option[2] for option in options)
+            candidates = [option[3] for option in options
+                          if option[2] >= best_route_score - 0.2]
+        else:
+            best_score = max(option[1] for option in options)
+            candidates = [option[3] for option in options if option[1] == best_score]
+        return random.choice(candidates)
 
     def sensors(self, walls, maps, spots, light_radius, heat_radius, prey_agents=None):
         if prey_agents is not None:
             self.prey_agents = prey_agents
+            self._scent_targets = tuple(prey for prey in prey_agents
+                                        if not prey.dead and not prey.being_eaten)
         base_state = super().sensors(walls, maps, spots, light_radius, heat_radius)
         scent_field = self._scent_at
         scent_direction, scent_gradient = self._gradient_state(
-            scent_field, AMOEBA_SCENT_REACH * 0.2,
+            scent_field, self.scent_reach * 0.2,
         )
         scent_level = min(2, int(scent_field(self.position) * 3))
         return (*base_state, scent_direction, scent_gradient, scent_level)
@@ -1055,15 +1252,27 @@ class Predator(Ameba):
                population_count=1):
         stress_multiplier = _population_stress_multiplier(population_count)
         light_radius, heat_radius, base_speed, _, dark_loss, _ = settings[:6]
-        self.speed = base_speed * PREDATOR_BASE_SPEED_RATIO * self._speed_scale()
+        self.speed_ratio = settings[7] if len(settings) > 7 else PREDATOR_BASE_SPEED_RATIO
+        self.hunger_drain_ratio = settings[8] if len(settings) > 8 else PREDATOR_HUNGER_DRAIN_RATIO
+        self.scent_reach = settings[9] if len(settings) > 9 else AMOEBA_SCENT_REACH
+        self.eating_duration = settings[10] if len(settings) > 10 else PREDATOR_EAT_SECONDS
+        self.kills_per_egg = int(settings[11]) if len(settings) > 11 else 3
+        if len(settings) > 20:
+            (self.prey_scent_weight, self.prey_trail_weight,
+             self.prey_crowding_weight, self.predator_trail_avoidance,
+             self.predator_crowding_avoidance) = settings[16:21]
+        self.speed = base_speed * self.speed_ratio * self._speed_scale()
+        self.scent_clock += dt
         self.prey_agents = prey_agents
+        self._scent_targets = tuple(prey for prey in prey_agents
+                                    if not prey.dead and not prey.being_eaten)
         self._scent_cache.clear()
         if self.scent_walls is not walls:
             self.scent_walls = walls
             self.scent_blockers = tuple(
                 wall.inflate(self.radius * 2, self.radius * 2) for wall in walls
             )
-        self.satiety -= dark_loss * PREDATOR_HUNGER_DRAIN_RATIO * dt * stress_multiplier
+        self.satiety -= dark_loss * self.hunger_drain_ratio * dt * stress_multiplier
         if self.satiety <= 0:
             if self.eating_prey is not None:
                 self.eating_prey.being_eaten = False
@@ -1122,9 +1331,11 @@ class Predator(Ameba):
             if escaped:
                 moved = True
                 self.trail.append(self.position.copy())
+                self.scent_trail.append((self.position.copy(), self.scent_clock))
             self.pending_reward -= 10.0
         elif moved:
             self.trail.append(self.position.copy())
+            self.scent_trail.append((self.position.copy(), self.scent_clock))
 
         actual_distance = old_position.distance_to(self.position)
         self.satiety -= (actual_distance * MOVE_ENERGY_PER_PIXEL * max(
@@ -1150,11 +1361,12 @@ class Predator(Ameba):
             if closest_point.distance_squared_to(prey.position) <= contact_distance ** 2:
                 self.position.update(closest_point)
                 self.trail.append(self.position.copy())
+                self.scent_trail.append((self.position.copy(), self.scent_clock))
                 self.eating_prey = prey
                 self.eating_prey.being_eaten = True
-                self.eating_timer = PREDATOR_EAT_SECONDS
+                self.eating_timer = self.eating_duration
 
-        if self.kills_since_egg >= 3 and self.reproduction_allowed:
+        if self.kills_since_egg >= self.kills_per_egg and self.reproduction_allowed:
             self.eggs_laid += 1
             self.total_eggs_laid += 1
             self.hatch_eggs_pending += 1
@@ -1609,12 +1821,14 @@ def _pretrain_predator_episode(predator_template, amoeba_template, walls, spots,
     for _ in range(1500):
         if stop_event.is_set() or hunter.dead or hunter.total_eggs_laid > eggs_before:
             break
-        for prey in tuple(amoebas):
-            prey.neighbor_agents = tuple(amoebas)
+        prey_frame = tuple(amoebas)
+        prey_population = sum(not agent.dead for agent in prey_frame)
+        for prey in prey_frame:
+            prey.neighbor_agents = prey_frame
             laid_before = prey.total_eggs_laid
             prey.update(
                 prey.decision_interval, walls, spots, maps, settings,
-                population_count=sum(not agent.dead for agent in amoebas),
+                population_count=prey_population,
             )
             for _ in range(prey.total_eggs_laid - laid_before):
                 eggs.append(Egg.from_parent("amoeba", prey.position, prey))
@@ -1642,8 +1856,33 @@ def _pretrain_predator_episode(predator_template, amoeba_template, walls, spots,
             hunter.accepted_sessions)
 
 
+def _draw_loading_screen(screen, title_image, completed, total, message):
+    screen.blit(title_image, (0, 0))
+    panel = pygame.Surface((WORLD_WIDTH, 112), pygame.SRCALPHA)
+    panel.fill((8, 18, 27, 205))
+    screen.blit(panel, (0, WORLD_HEIGHT - 112))
+    font = pygame.font.Font(None, 30)
+    small_font = pygame.font.Font(None, 23)
+    screen.blit(font.render(message, True, (245, 248, 250)), (24, WORLD_HEIGHT - 102))
+    if total:
+        label = f"Предобучение: {completed} / {total} циклов"
+        fraction = min(1.0, completed / total)
+    else:
+        label = "Запуск симуляции…"
+        fraction = 0.0
+    screen.blit(small_font.render(label, True, (215, 225, 232)), (24, WORLD_HEIGHT - 66))
+    bar = pygame.Rect(24, WORLD_HEIGHT - 34, WORLD_WIDTH - 48, 12)
+    pygame.draw.rect(screen, (75, 91, 103), bar, border_radius=6)
+    if fraction:
+        fill = bar.copy()
+        fill.width = max(12, round(bar.width * fraction))
+        pygame.draw.rect(screen, (87, 205, 145), fill, border_radius=6)
+    pygame.display.flip()
+
+
 def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
-                    stop_event, progress, cycles, logger=None):
+                    stop_event, progress, cycles, logger=None,
+                    loading_screen=None, title_image=None):
     amoeba.defer_training_save = True
     predator.defer_training_save = True
     with progress.get_lock():
@@ -1667,28 +1906,44 @@ def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
         predator_kills_before = predator.total_kills
         if logger is not None:
             logger.record_settings(read_settings(shared_settings))
+        phase_timings = {}
+        phase_started = time.perf_counter()
         walls, spots = make_world()
+        phase_timings["world_generation"] = round(time.perf_counter() - phase_started, 4)
+        phase_started = time.perf_counter()
         maps = SensorMaps(walls, spots)
+        phase_timings["sensor_maps"] = round(time.perf_counter() - phase_started, 4)
         with progress.get_lock():
             progress[2] = 1
+        phase_started = time.perf_counter()
         walls, spots, maps, laid, learned = _pretrain_amoeba_episode(
             amoeba, walls, spots, maps, shared_settings, stop_event,
         )
+        phase_timings["amoeba_episode"] = round(time.perf_counter() - phase_started, 4)
         amoeba_eggs += laid
         amoeba_learned_sessions += learned
         with progress.get_lock():
             progress[3] = amoeba_eggs
             progress[5] = amoeba_learned_sessions
             progress[2] = 3
+        if loading_screen is not None:
+            _draw_loading_screen(
+                loading_screen, title_image, cycle_index, cycles,
+                "Предобучение: хищник",
+            )
         for spot in spots:
             spot.value = 100.0
+        phase_started = time.perf_counter()
         walls, spots, maps, laid, learned = _pretrain_predator_episode(
             predator, amoeba, walls, spots, maps, shared_settings, stop_event,
         )
+        phase_timings["predator_episode"] = round(time.perf_counter() - phase_started, 4)
         predator_eggs += laid
         predator_learned_sessions += learned
+        phase_started = time.perf_counter()
         amoeba.save_training_state()
         predator.save_training_state()
+        phase_timings["save_training_state"] = round(time.perf_counter() - phase_started, 4)
         if logger is not None:
             logger.write(
                 "pretrain_cycle", cycle=cycle_index + 1,
@@ -1701,11 +1956,17 @@ def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
                 predator_steps=predator.steps - predator_steps_before,
                 amoeba_genotypes=len(amoeba.training_brain_bank),
                 predator_genotypes=len(predator.training_brain_bank),
+                phase_wall_s=phase_timings,
             )
         with progress.get_lock():
             progress[0] = cycle_index + 1
             progress[4] = predator_eggs
             progress[6] = predator_learned_sessions
+        if loading_screen is not None:
+            _draw_loading_screen(
+                loading_screen, title_image, cycle_index + 1, cycles,
+                "Предобучение завершено" if cycle_index + 1 == cycles else "Предобучение: амёба",
+            )
 
     if not stop_event.is_set():
         walls, spots = make_world()
@@ -1718,6 +1979,17 @@ def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
 
 def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
     pygame.init()
+    screen = pygame.display.set_mode((WORLD_WIDTH, WORLD_HEIGHT))
+    pygame.display.set_caption("Загрузка симуляции")
+    title_path = Path(__file__).resolve().with_name("title.png")
+    try:
+        title_image = pygame.transform.smoothscale(
+            pygame.image.load(title_path).convert(), (WORLD_WIDTH, WORLD_HEIGHT),
+        )
+    except (pygame.error, OSError):
+        title_image = pygame.Surface((WORLD_WIDTH, WORLD_HEIGHT))
+        title_image.fill((20, 34, 45))
+    _draw_loading_screen(screen, title_image, 0, pretrain_episodes, "Подготовка симуляции…")
     seed = random.randrange(2 ** 32)
     random.seed(seed)
     logger = SimulationLogger()
@@ -1748,7 +2020,7 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
     if pretrain_episodes > 0:
         walls, spots, maps = pretrain_agents(
             first_amoeba, predator, walls, spots, maps, shared_settings,
-            stop_event, progress, pretrain_episodes, logger,
+            stop_event, progress, pretrain_episodes, logger, screen, title_image,
         )
 
     with progress.get_lock():
@@ -1761,7 +2033,6 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
         pygame.quit()
         return
 
-    screen = pygame.display.set_mode((WORLD_WIDTH, WORLD_HEIGHT))
     pygame.display.set_caption("Амёбы и хищники — 800 × 600")
     clock = pygame.time.Clock()
     wall_overlay = make_wall_overlay(walls)
@@ -1783,13 +2054,15 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
         settings = read_settings(shared_settings)
         logger.record_settings(settings)
 
-        for amoeba in tuple(amoebas):
+        amoeba_frame = tuple(amoebas)
+        amoeba_population = sum(not agent.dead for agent in amoeba_frame)
+        for amoeba in amoeba_frame:
             amoeba.reproduction_allowed = True
-            amoeba.neighbor_agents = tuple(amoebas)
+            amoeba.neighbor_agents = amoeba_frame
             eggs_before = amoeba.total_eggs_laid
             amoeba.update(
                 dt, walls, spots, maps, settings, auto_respawn=False,
-                population_count=sum(not agent.dead for agent in amoebas),
+                population_count=amoeba_population,
             )
             for _ in range(amoeba.total_eggs_laid - eggs_before):
                 egg = Egg.from_parent("amoeba", amoeba.position, amoeba)
@@ -1802,6 +2075,7 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
                              satiety=round(amoeba.satiety, 2),
                              visited_cells=len(amoeba.visited_cells))
                 amoebas.remove(amoeba)
+                amoeba_population -= 1
 
         if not predator_ever_spawned and len(amoebas) >= MIN_AMOEBA_FOR_PREDATOR:
             predator_start = _predator_spawn_position(walls, maps, spots, amoebas)
@@ -1813,13 +2087,16 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
                 ))
                 predator_ever_spawned = True
 
-        for hunter in tuple(predators):
+        predator_frame = tuple(predators)
+        predator_population = sum(not hunter.dead for hunter in predator_frame)
+        for hunter in predator_frame:
             hunter.reproduction_allowed = True
+            hunter.neighbor_agents = predator_frame
             kills_before = hunter.total_kills
             living_prey_before = {id(prey): prey for prey in amoebas if not prey.dead}
             hunter.update(
                 dt, walls, spots, maps, settings, amoebas,
-                population_count=sum(not agent.dead for agent in predators),
+                population_count=predator_population,
             )
             new_kills = hunter.total_kills - kills_before
             if new_kills:
@@ -1845,6 +2122,7 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
                              satiety=round(hunter.satiety, 2),
                              visited_cells=len(hunter.visited_cells))
                 predators.remove(hunter)
+                predator_population -= 1
         amoebas[:] = [amoeba for amoeba in amoebas if not amoeba.dead]
 
         if not amoebas or (predator_ever_spawned and not predators):
@@ -1940,19 +2218,27 @@ def run_control_window():
         "completion_prompted": False,
     }
     root = tk.Tk()
-    root.title("Параметры амёбы")
+    root.title("Конфигурация симуляции")
     root.resizable(False, False)
-    root.geometry("460x690")
+    root.geometry("540x790")
 
-    ttk.Label(root, text="Настройки симуляции", font=("Segoe UI", 15, "bold")).pack(pady=(18, 4))
-    ttk.Label(root, text="Изменения применяются сразу", foreground="#52616b").pack(pady=(0, 12))
-    controls = ttk.Frame(root, padding=(20, 0, 20, 0))
-    controls.pack(fill="x")
+    ttk.Label(root, text="Конфигурация симуляции", font=("Segoe UI", 15, "bold")).pack(pady=(14, 2))
+    ttk.Label(root, text="Изменения применяются сразу", foreground="#52616b").pack(pady=(0, 8))
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+    amoeba_tab = ttk.Frame(notebook, padding=12)
+    predator_tab = ttk.Frame(notebook, padding=12)
+    success_tab = ttk.Frame(notebook, padding=12)
+    notebook.add(amoeba_tab, text="Амёба")
+    notebook.add(predator_tab, text="Хищник")
+    notebook.add(success_tab, text="Успешность")
 
-    for index, (name, bounds, initial) in enumerate(zip(SETTING_NAMES, SETTING_RANGES, SETTING_DEFAULTS)):
-        minimum, maximum, resolution = bounds
-        row = ttk.Frame(controls)
-        row.pack(fill="x", pady=5)
+    def add_setting_slider(parent, index):
+        name = SETTING_NAMES[index]
+        minimum, maximum, resolution = SETTING_RANGES[index]
+        initial = SETTING_DEFAULTS[index]
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(5, 0))
         value_label = ttk.Label(row, width=7, anchor="e")
         value_label.pack(side="right")
         ttk.Label(row, text=name).pack(side="left")
@@ -1963,25 +2249,50 @@ def run_control_window():
                 shared_settings[setting_index] = numeric_value
             output.configure(text=f"{numeric_value:g}")
 
-        scale = tk.Scale(controls, from_=minimum, to=maximum, resolution=resolution,
-                         orient="horizontal", showvalue=False, length=385, command=on_change)
+        scale = tk.Scale(parent, from_=minimum, to=maximum, resolution=resolution,
+                         orient="horizontal", showvalue=False, length=450, command=on_change)
         scale.set(initial)
         scale.pack(fill="x")
         value_label.configure(text=f"{initial:g}")
 
-    status = ttk.Label(root, text="Симуляция остановлена", foreground="#52616b")
-    status.pack(pady=(8, 4))
-    training_row = ttk.Frame(root)
-    training_row.pack(pady=(8, 2))
+    amoeba_config = ttk.LabelFrame(amoeba_tab, text="Питание и восприятие", padding=8)
+    amoeba_config.pack(fill="x")
+    for index in (*range(6), 12, 13, 14, 15):
+        add_setting_slider(amoeba_config, index)
+    ttk.Label(
+        amoeba_tab,
+        text="Амёба обходит собственные и чужие следы, а также скопления сородичей. Гены связывают скорость, зрение и обоняние; скорость повышает расход энергии.",
+        wraplength=460, justify="left", foreground="#52616b",
+    ).pack(fill="x", pady=(10, 0))
+
+    predator_config = ttk.LabelFrame(predator_tab, text="Охота и выживание", padding=8)
+    predator_config.pack(fill="x")
+    for index in (*range(7, 11), 16, 17, 18, 19, 20):
+        add_setting_slider(predator_config, index)
+    ttk.Label(
+        predator_tab,
+        text="Хищника привлекают запах, следы и скопления амёб; собственные следы и другие хищники отталкивают. Скорость и обоняние зависят от генов.",
+        wraplength=460, justify="left", foreground="#52616b",
+    ).pack(fill="x", pady=(10, 0))
+
+    success_config = ttk.LabelFrame(success_tab, text="Критерии успешной сессии", padding=8)
+    success_config.pack(fill="x")
+    add_setting_slider(success_config, 6)
+    add_setting_slider(success_config, 11)
+    training_row = ttk.Frame(success_tab)
+    training_row.pack(fill="x", pady=(16, 4))
     ttk.Label(training_row, text="Циклов предобучения:").pack(side="left", padx=(0, 8))
     episode_count = tk.IntVar(value=100)
-    tk.Spinbox(training_row, from_=1, to=5000, increment=25, textvariable=episode_count, width=8).pack(side="left")
+    tk.Spinbox(training_row, from_=1, to=5000, increment=25,
+               textvariable=episode_count, width=8).pack(side="left")
     ttk.Label(
-        root,
-        text="В каждом цикле тренируются оба вида. Амёбе нужна заданная норма яиц; хищнику — 3 пойманные амёбы и отложенное яйцо. Только такие сессии обучают Q-таблицы.",
-        wraplength=405,
-        justify="center",
-    ).pack(pady=(2, 8))
+        success_tab,
+        text="Цикл засчитывает сессию амёбы после заданного числа яиц. Сессия хищника успешна, когда он поймал нужное число амёб и отложил яйцо. Только успешные сессии закрепляются в Q-таблице.",
+        wraplength=460, justify="left", foreground="#52616b",
+    ).pack(fill="x", pady=(8, 0))
+
+    status = ttk.Label(root, text="Симуляция остановлена", foreground="#52616b")
+    status.pack(pady=(8, 4))
 
     def start_simulation(pretrain_episodes=0):
         process = simulation["process"]
