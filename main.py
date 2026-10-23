@@ -5,6 +5,7 @@ import json
 import unittest
 import copy
 import time
+from array import array
 from collections import deque
 from functools import lru_cache
 from pathlib import Path
@@ -53,9 +54,85 @@ def _population_stress_multiplier(population_count):
     if population_count <= 5:
         return 1.0
     return 1.1 + 0.05 * (population_count - 6)
+
+
 MIN_AMOEBA_FOR_PREDATOR = 4
 MIN_REACHABLE_PREY_FOR_PREDATOR = 2
 EGG_HATCH_SECONDS = 10.0
+SOUND_SAMPLE_RATE = 22050
+SPLASH_DURATION_SECONDS = 10 * 60
+
+
+class SimulationAudio:
+    """MIDI soundtrack with a small synthesized fallback and event effects."""
+
+    def __init__(self, project_dir):
+        self.available = False
+        self.effect_channel = None
+        self.music_channel = None
+        try:
+            pygame.mixer.init(frequency=SOUND_SAMPLE_RATE, size=-16, channels=1, buffer=512)
+        except pygame.error:
+            return
+        self.available = True
+        self.effect_channel = pygame.mixer.Channel(1)
+        self.music_channel = pygame.mixer.Channel(0)
+        self.effect_sounds = {
+            "attack": self._render_notes(((42, 0.0, 0.16, 0.65), (35, 0.12, 0.22, 0.8)), 0.38),
+            "eat": self._render_notes(((55, 0.0, 0.1, 0.5), (62, 0.1, 0.16, 0.65)), 0.3),
+            "egg": self._render_notes(((76, 0.0, 0.13, 0.45), (83, 0.12, 0.22, 0.55)), 0.4),
+            "hatch": self._render_notes(((72, 0.0, 0.13, 0.4), (79, 0.12, 0.13, 0.45),
+                                          (84, 0.24, 0.24, 0.5)), 0.52),
+            "death": self._render_notes(((65, 0.0, 0.18, 0.45), (58, 0.17, 0.28, 0.5)), 0.5),
+            "food": self._render_notes(((67, 0.0, 0.1, 0.35), (74, 0.1, 0.15, 0.4)), 0.3),
+        }
+        self.effect_channel.set_volume(0.35)
+        try:
+            pygame.mixer.music.load(str(Path(project_dir) / "music.mid"))
+            pygame.mixer.music.set_volume(0.2)
+            pygame.mixer.music.play(-1)
+        except pygame.error:
+            self.music_channel.set_volume(0.18)
+            self.music_channel.play(self._fallback_music(), loops=-1)
+
+    @staticmethod
+    def _render_notes(notes, duration):
+        sample_count = round(SOUND_SAMPLE_RATE * duration)
+        samples = array("h", [0]) * sample_count
+        for midi_note, start, note_duration, velocity in notes:
+            first = max(0, round(start * SOUND_SAMPLE_RATE))
+            last = min(sample_count, round((start + note_duration) * SOUND_SAMPLE_RATE))
+            frequency = 440.0 * 2 ** ((midi_note - 69) / 12)
+            note_samples = max(1, last - first)
+            for index in range(first, last):
+                progress = (index - first) / note_samples
+                envelope = min(1.0, progress * 18, (1.0 - progress) * 5)
+                phase = 2 * math.pi * frequency * (index - first) / SOUND_SAMPLE_RATE
+                tone = math.sin(phase) + math.sin(2 * phase) * 0.22
+                mixed = samples[index] + round(tone * envelope * velocity * 11500)
+                samples[index] = max(-32768, min(32767, mixed))
+        return pygame.mixer.Sound(buffer=samples.tobytes())
+
+    def _fallback_music(self):
+        melody = (62, 65, 69, 72, 69, 67, 65, 62, 60, 64, 67, 72, 67, 64, 62, 60)
+        beat = 0.48
+        notes = [(note, index * beat, beat * 0.78, 0.34)
+                 for index, note in enumerate(melody)]
+        bass = (50, 53, 48, 55)
+        notes.extend((note, index * beat * 4, beat * 3.7, 0.2)
+                     for index, note in enumerate(bass))
+        return self._render_notes(notes, len(melody) * beat)
+
+    def play(self, event):
+        sound = getattr(self, "effect_sounds", {}).get(event)
+        if self.available and sound is not None:
+            self.effect_channel.play(sound)
+
+    def close(self):
+        if self.available:
+            pygame.mixer.music.stop()
+            self.music_channel.stop()
+            self.effect_channel.stop()
 
 
 class SimulationLogger:
@@ -339,6 +416,8 @@ class Ameba:
         self._cached_scent_sources = ()
         self._wall_grid_source = None
         self._wall_grid = {}
+        self._wall_grid_cell = None
+        self._wall_grid_candidates = ()
         self.previous_state = None
         self.previous_action = None
         self.pending_reward = 0.0
@@ -378,9 +457,14 @@ class Ameba:
                         buckets.setdefault((cell_x, cell_y), []).append(wall)
             self._wall_grid = buckets
             self._wall_grid_source = walls
+            self._wall_grid_cell = None
+            self._wall_grid_candidates = ()
         radius_squared = self.radius * self.radius
         cell = (int(point.x // CELL_SIZE), int(point.y // CELL_SIZE))
-        for wall in self._wall_grid.get(cell, ()):
+        if cell != self._wall_grid_cell:
+            self._wall_grid_candidates = self._wall_grid.get(cell, ())
+            self._wall_grid_cell = cell
+        for wall in self._wall_grid_candidates:
             nearest_x = max(wall.left, min(point.x, wall.right))
             nearest_y = max(wall.top, min(point.y, wall.bottom))
             if (point.x - nearest_x) ** 2 + (point.y - nearest_y) ** 2 < radius_squared:
@@ -466,10 +550,9 @@ class Ameba:
                 if distance_squared > reach_squared:
                     continue
                 distance = math.sqrt(distance_squared)
-                scent = smell_scale * math.exp(
+                intensity += smell_scale * math.exp(
                     -age / 16.0 - distance / (140.0 * smell_scale)
                 )
-                intensity += scent
         return min(3.0, intensity)
 
     def _neighbor_density_at(self, point):
@@ -1010,23 +1093,76 @@ class Predator(Ameba):
         self.eating_timer = 0.0
         self.scent_walls = []
         self.scent_blockers = ()
+        self.scent_blocker_grid = {}
+        self._scent_blocker_marks = []
+        self._scent_ray_generation = 0
         self._scent_cache = {}
         self._scent_targets = None
 
     def _scent_blocked(self, point, source_position):
         if not self.scent_blockers or point.distance_squared_to(source_position) <= 0.0:
             return False
+        if len(self._scent_blocker_marks) != len(self.scent_blockers):
+            self._index_scent_blockers()
         segment_start = (round(point.x), round(point.y))
         segment_end = (round(source_position.x), round(source_position.y))
-        segment_bounds = pygame.Rect(
-            min(segment_start[0], segment_end[0]),
-            min(segment_start[1], segment_end[1]),
-            max(1, abs(segment_end[0] - segment_start[0])),
-            max(1, abs(segment_end[1] - segment_start[1])),
-        )
-        candidates = segment_bounds.collidelistall(self.scent_blockers)
-        return any(self.scent_blockers[index].clipline(segment_start, segment_end)
-                   for index in candidates)
+        cell_size = CELL_SIZE
+        cell_x, cell_y = segment_start[0] // cell_size, segment_start[1] // cell_size
+        end_x, end_y = segment_end[0] // cell_size, segment_end[1] // cell_size
+        delta_x = segment_end[0] - segment_start[0]
+        delta_y = segment_end[1] - segment_start[1]
+        step_x = (delta_x > 0) - (delta_x < 0)
+        step_y = (delta_y > 0) - (delta_y < 0)
+        if step_x:
+            boundary_x = (cell_x + (step_x > 0)) * cell_size
+            next_x = (boundary_x - segment_start[0]) / delta_x
+            delta_t_x = cell_size / abs(delta_x)
+        else:
+            next_x = delta_t_x = math.inf
+        if step_y:
+            boundary_y = (cell_y + (step_y > 0)) * cell_size
+            next_y = (boundary_y - segment_start[1]) / delta_y
+            delta_t_y = cell_size / abs(delta_y)
+        else:
+            next_y = delta_t_y = math.inf
+
+        self._scent_ray_generation += 1
+        if self._scent_ray_generation >= 2 ** 30:
+            self._scent_blocker_marks[:] = [0] * len(self.scent_blockers)
+            self._scent_ray_generation = 1
+        generation = self._scent_ray_generation
+        while True:
+            for blocker_index in self.scent_blocker_grid.get((cell_x, cell_y), ()):
+                if self._scent_blocker_marks[blocker_index] == generation:
+                    continue
+                self._scent_blocker_marks[blocker_index] = generation
+                if self.scent_blockers[blocker_index].clipline(segment_start, segment_end):
+                    return True
+            if cell_x == end_x and cell_y == end_y:
+                return False
+            if next_x < next_y:
+                cell_x += step_x
+                next_x += delta_t_x
+            elif next_y < next_x:
+                cell_y += step_y
+                next_y += delta_t_y
+            else:
+                cell_x += step_x
+                cell_y += step_y
+                next_x += delta_t_x
+                next_y += delta_t_y
+
+    def _index_scent_blockers(self):
+        buckets = {}
+        for blocker_index, blocker in enumerate(self.scent_blockers):
+            left, right = int(blocker.left // CELL_SIZE), int(blocker.right // CELL_SIZE)
+            top, bottom = int(blocker.top // CELL_SIZE), int(blocker.bottom // CELL_SIZE)
+            for cell_y in range(top, bottom + 1):
+                for cell_x in range(left, right + 1):
+                    buckets.setdefault((cell_x, cell_y), []).append(blocker_index)
+        self.scent_blocker_grid = {cell: tuple(indices) for cell, indices in buckets.items()}
+        self._scent_blocker_marks = [0] * len(self.scent_blockers)
+        self._scent_ray_generation = 0
 
     def _scent_at(self, point):
         cache_key = (point.x, point.y, id(self.scent_blockers))
@@ -1272,6 +1408,7 @@ class Predator(Ameba):
             self.scent_blockers = tuple(
                 wall.inflate(self.radius * 2, self.radius * 2) for wall in walls
             )
+            self._index_scent_blockers()
         self.satiety -= dark_loss * self.hunger_drain_ratio * dt * stress_multiplier
         if self.satiety <= 0:
             if self.eating_prey is not None:
@@ -1762,7 +1899,8 @@ def read_settings(shared_settings):
         return tuple(shared_settings[:])
 
 
-def _pretrain_amoeba_episode(agent, walls, spots, maps, shared_settings, stop_event):
+def _pretrain_amoeba_episode(agent, walls, spots, maps, shared_settings, stop_event,
+                            loading_update=None):
     agent.set_start(_dark_start_position(maps, spots))
     for spot in spots:
         spot.value = 100.0
@@ -1776,6 +1914,8 @@ def _pretrain_amoeba_episode(agent, walls, spots, maps, shared_settings, stop_ev
             population_count=1,
         )
         steps_in_episode += 1
+        if loading_update is not None and steps_in_episode % 25 == 0:
+            loading_update("Подготовка поведения амёб")
     if agent.episode == episode_before:
         if agent.previous_state is not None:
             agent.episode_experiences.append((
@@ -1788,7 +1928,7 @@ def _pretrain_amoeba_episode(agent, walls, spots, maps, shared_settings, stop_ev
 
 
 def _pretrain_predator_episode(predator_template, amoeba_template, walls, spots, maps,
-                               shared_settings, stop_event):
+                               shared_settings, stop_event, loading_update=None):
     amoebas = []
     starts = []
     for _ in range(MIN_AMOEBA_FOR_PREDATOR):
@@ -1818,7 +1958,7 @@ def _pretrain_predator_episode(predator_template, amoeba_template, walls, spots,
     eggs_before = hunter.total_eggs_laid
     settings = read_settings(shared_settings)
 
-    for _ in range(1500):
+    for step in range(1500):
         if stop_event.is_set() or hunter.dead or hunter.total_eggs_laid > eggs_before:
             break
         prey_frame = tuple(amoebas)
@@ -1849,6 +1989,8 @@ def _pretrain_predator_episode(predator_template, amoeba_template, walls, spots,
                 prey.set_start(egg.position)
                 amoebas.append(prey)
                 eggs.remove(egg)
+        if loading_update is not None and step % 25 == 0:
+            loading_update("Подготовка поведения хищника")
 
     if not hunter.dead and hunter.total_eggs_laid == eggs_before and not stop_event.is_set():
         hunter.mark_dead(-100.0)
@@ -1856,7 +1998,8 @@ def _pretrain_predator_episode(predator_template, amoeba_template, walls, spots,
             hunter.accepted_sessions)
 
 
-def _draw_loading_screen(screen, title_image, completed, total, message):
+def _draw_loading_screen(screen, title_image, fraction, message):
+    pygame.event.pump()
     screen.blit(title_image, (0, 0))
     panel = pygame.Surface((WORLD_WIDTH, 112), pygame.SRCALPHA)
     panel.fill((8, 18, 27, 205))
@@ -1864,12 +2007,7 @@ def _draw_loading_screen(screen, title_image, completed, total, message):
     font = pygame.font.Font(None, 30)
     small_font = pygame.font.Font(None, 23)
     screen.blit(font.render(message, True, (245, 248, 250)), (24, WORLD_HEIGHT - 102))
-    if total:
-        label = f"Предобучение: {completed} / {total} циклов"
-        fraction = min(1.0, completed / total)
-    else:
-        label = "Запуск симуляции…"
-        fraction = 0.0
+    label = f"Загрузка игры: {round(fraction * 100)}%"
     screen.blit(small_font.render(label, True, (215, 225, 232)), (24, WORLD_HEIGHT - 66))
     bar = pygame.Rect(24, WORLD_HEIGHT - 34, WORLD_WIDTH - 48, 12)
     pygame.draw.rect(screen, (75, 91, 103), bar, border_radius=6)
@@ -1881,8 +2019,7 @@ def _draw_loading_screen(screen, title_image, completed, total, message):
 
 
 def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
-                    stop_event, progress, cycles, logger=None,
-                    loading_screen=None, title_image=None):
+                    stop_event, progress, cycles, logger=None, loading_update=None):
     amoeba.defer_training_save = True
     predator.defer_training_save = True
     with progress.get_lock():
@@ -1918,6 +2055,7 @@ def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
         phase_started = time.perf_counter()
         walls, spots, maps, laid, learned = _pretrain_amoeba_episode(
             amoeba, walls, spots, maps, shared_settings, stop_event,
+            loading_update,
         )
         phase_timings["amoeba_episode"] = round(time.perf_counter() - phase_started, 4)
         amoeba_eggs += laid
@@ -1926,16 +2064,12 @@ def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
             progress[3] = amoeba_eggs
             progress[5] = amoeba_learned_sessions
             progress[2] = 3
-        if loading_screen is not None:
-            _draw_loading_screen(
-                loading_screen, title_image, cycle_index, cycles,
-                "Предобучение: хищник",
-            )
         for spot in spots:
             spot.value = 100.0
         phase_started = time.perf_counter()
         walls, spots, maps, laid, learned = _pretrain_predator_episode(
             predator, amoeba, walls, spots, maps, shared_settings, stop_event,
+            loading_update,
         )
         phase_timings["predator_episode"] = round(time.perf_counter() - phase_started, 4)
         predator_eggs += laid
@@ -1962,11 +2096,6 @@ def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
             progress[0] = cycle_index + 1
             progress[4] = predator_eggs
             progress[6] = predator_learned_sessions
-        if loading_screen is not None:
-            _draw_loading_screen(
-                loading_screen, title_image, cycle_index + 1, cycles,
-                "Предобучение завершено" if cycle_index + 1 == cycles else "Предобучение: амёба",
-            )
 
     if not stop_event.is_set():
         walls, spots = make_world()
@@ -1979,6 +2108,8 @@ def pretrain_agents(amoeba, predator, walls, spots, maps, shared_settings,
 
 def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
     pygame.init()
+    loading_started = time.monotonic()
+    audio = SimulationAudio(Path(__file__).resolve().parent)
     screen = pygame.display.set_mode((WORLD_WIDTH, WORLD_HEIGHT))
     pygame.display.set_caption("Загрузка симуляции")
     title_path = Path(__file__).resolve().with_name("title.png")
@@ -1989,7 +2120,20 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
     except (pygame.error, OSError):
         title_image = pygame.Surface((WORLD_WIDTH, WORLD_HEIGHT))
         title_image.fill((20, 34, 45))
-    _draw_loading_screen(screen, title_image, 0, pretrain_episodes, "Подготовка симуляции…")
+    last_loading_draw = 0.0
+
+    def refresh_loading(message="Подготовка симуляции…", force=False):
+        nonlocal last_loading_draw
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                stop_event.set()
+        now = time.monotonic()
+        if force or now - last_loading_draw >= 0.1:
+            fraction = min(0.99, max(0.0, (now - loading_started) / SPLASH_DURATION_SECONDS))
+            _draw_loading_screen(screen, title_image, fraction, message)
+            last_loading_draw = now
+
+    refresh_loading()
     seed = random.randrange(2 ** 32)
     random.seed(seed)
     logger = SimulationLogger()
@@ -2020,18 +2164,33 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
     if pretrain_episodes > 0:
         walls, spots, maps = pretrain_agents(
             first_amoeba, predator, walls, spots, maps, shared_settings,
-            stop_event, progress, pretrain_episodes, logger, screen, title_image,
+            stop_event, progress, pretrain_episodes, logger, refresh_loading,
         )
+
+    if stop_event.is_set():
+        logger.close("stopped_during_pretraining")
+        audio.close()
+        pygame.quit()
+        return
+
+    with progress.get_lock():
+        progress[2] = 4
+    while (not stop_event.is_set()
+           and time.monotonic() - loading_started < SPLASH_DURATION_SECONDS):
+        refresh_loading("Загрузка игровых ресурсов…", force=True)
+        pygame.time.wait(50)
+
+    if stop_event.is_set():
+        logger.close("stopped_during_loading")
+        audio.close()
+        pygame.quit()
+        return
 
     with progress.get_lock():
         progress[0] = pretrain_episodes
         progress[1] = pretrain_episodes
         progress[2] = 2
-
-    if stop_event.is_set():
-        logger.close("stopped_during_pretraining")
-        pygame.quit()
-        return
+    _draw_loading_screen(screen, title_image, 1.0, "Загрузка завершена")
 
     pygame.display.set_caption("Амёбы и хищники — 800 × 600")
     clock = pygame.time.Clock()
@@ -2060,16 +2219,21 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
             amoeba.reproduction_allowed = True
             amoeba.neighbor_agents = amoeba_frame
             eggs_before = amoeba.total_eggs_laid
+            was_feeding = amoeba.currently_feeding
             amoeba.update(
                 dt, walls, spots, maps, settings, auto_respawn=False,
                 population_count=amoeba_population,
             )
+            if not was_feeding and amoeba.currently_feeding:
+                audio.play("food")
             for _ in range(amoeba.total_eggs_laid - eggs_before):
                 egg = Egg.from_parent("amoeba", amoeba.position, amoeba)
                 eggs.append(egg)
+                audio.play("egg")
                 logger.write("egg_laid", species="amoeba", parent_genome=egg.parent_genome,
                              child_genome=egg.genome)
             if amoeba.dead:
+                audio.play("death")
                 logger.deaths["amoeba"] += 1
                 logger.write("death", species="amoeba", genome=amoeba.genome,
                              satiety=round(amoeba.satiety, 2),
@@ -2093,13 +2257,17 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
             hunter.reproduction_allowed = True
             hunter.neighbor_agents = predator_frame
             kills_before = hunter.total_kills
+            was_eating = hunter.eating_prey is not None
             living_prey_before = {id(prey): prey for prey in amoebas if not prey.dead}
             hunter.update(
                 dt, walls, spots, maps, settings, amoebas,
                 population_count=predator_population,
             )
+            if not was_eating and hunter.eating_prey is not None:
+                audio.play("attack")
             new_kills = hunter.total_kills - kills_before
             if new_kills:
+                audio.play("eat")
                 logger.kills += new_kills
                 logger.write("predation", predator_genome=hunter.genome, kills=new_kills,
                              total_kills=hunter.total_kills,
@@ -2113,10 +2281,12 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
             while hunter.hatch_eggs_pending:
                 egg = Egg.from_parent("predator", hunter.position, hunter)
                 eggs.append(egg)
+                audio.play("egg")
                 logger.write("egg_laid", species="predator", parent_genome=egg.parent_genome,
                              child_genome=egg.genome)
                 hunter.hatch_eggs_pending -= 1
             if hunter.dead:
+                audio.play("death")
                 logger.deaths["predator"] += 1
                 logger.write("death", species="predator", genome=hunter.genome,
                              satiety=round(hunter.satiety, 2),
@@ -2163,6 +2333,7 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
                     first_amoeba.training_brain_bank, predator.training_brain_bank,
                 )
                 amoebas.append(agent)
+                audio.play("hatch")
                 logger.births["amoeba"] += 1
                 logger.write("birth", species="amoeba", parent_genome=egg.parent_genome,
                              genome=agent.genome, q_entries=len(agent.q_table))
@@ -2176,6 +2347,7 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
                     first_amoeba.training_brain_bank, predator.training_brain_bank,
                 )
                 predators.append(agent)
+                audio.play("hatch")
                 logger.births["predator"] += 1
                 logger.write("birth", species="predator", parent_genome=egg.parent_genome,
                              genome=agent.genome, q_entries=len(agent.q_table))
@@ -2205,6 +2377,7 @@ def run_simulation(shared_settings, stop_event, pretrain_episodes, progress):
                        first_amoeba.steps, predator.steps)
 
     logger.close("stopped" if stop_event.is_set() else "window_closed")
+    audio.close()
     pygame.quit()
 
 
@@ -2334,7 +2507,12 @@ def run_control_window():
             amoeba_eggs, predator_eggs = int(progress[3]), int(progress[4])
             amoeba_sessions, predator_sessions = int(progress[5]), int(progress[6])
         if process is not None and process.is_alive():
-            if phase == 1:
+            if phase == 4:
+                status.configure(
+                    text="Заставка: имитация загрузки игры (до 10 минут)",
+                    foreground="#8a6414",
+                )
+            elif phase == 1:
                 status.configure(
                     text=f"Цикл {completed + 1} / {total}: амёба · яйца {amoeba_eggs}, сессии {amoeba_sessions} · хищник · яйца {predator_eggs}, сессии {predator_sessions}",
                     foreground="#8a6414",

@@ -1,5 +1,6 @@
 import unittest
 import math
+from unittest.mock import patch
 from collections import deque
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -20,6 +21,19 @@ class NavigationRegressionTests(unittest.TestCase):
 
     def setUp(self):
         self.agent = main.Ameba()
+
+    def test_midi_music_asset_is_a_standard_midi_file(self):
+        midi_path = Path(__file__).resolve().parents[1] / "music.mid"
+        data = midi_path.read_bytes()
+        self.assertTrue(data.startswith(b"MThd"))
+        self.assertEqual(int.from_bytes(data[10:12], "big"), 3)
+
+    def test_audio_disables_cleanly_when_no_device_is_available(self):
+        with patch.object(main.pygame.mixer, "init", side_effect=main.pygame.error):
+            audio = main.SimulationAudio(Path(__file__).resolve().parents[1])
+        self.assertFalse(audio.available)
+        audio.play("egg")
+        audio.close()
 
     def test_circle_can_pass_clear_of_a_wall_corner(self):
         wall = pygame.Rect(100, 100, 10, 10)
@@ -435,6 +449,22 @@ class NavigationRegressionTests(unittest.TestCase):
             for wall in predator.scent_walls
         )
         self.assertEqual(predator._scent_at(pygame.Vector2(200, 200)), 0.0)
+
+    def test_predator_scent_grid_blocks_walls_and_keeps_clear_lines(self):
+        predator = main.Predator()
+        predator.scent_walls = [pygame.Rect(490, 150, 10, 100)]
+        predator.scent_blockers = tuple(
+            wall.inflate(predator.radius * 2, predator.radius * 2)
+            for wall in predator.scent_walls
+        )
+        predator._index_scent_blockers()
+
+        self.assertTrue(predator._scent_blocked(
+            pygame.Vector2(200, 200), pygame.Vector2(700, 200),
+        ))
+        self.assertFalse(predator._scent_blocked(
+            pygame.Vector2(200, 100), pygame.Vector2(700, 100),
+        ))
 
     def test_predator_lays_egg_after_three_catches(self):
         class FlatMaps:
