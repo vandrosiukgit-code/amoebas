@@ -60,7 +60,7 @@ MIN_AMOEBA_FOR_PREDATOR = 4
 MIN_REACHABLE_PREY_FOR_PREDATOR = 2
 EGG_HATCH_SECONDS = 10.0
 SOUND_SAMPLE_RATE = 22050
-SPLASH_DURATION_SECONDS = 10 * 60
+SPLASH_DURATION_SECONDS = 10
 
 
 class SimulationAudio:
@@ -2509,7 +2509,7 @@ def run_control_window():
         if process is not None and process.is_alive():
             if phase == 4:
                 status.configure(
-                    text="Заставка: имитация загрузки игры (до 10 минут)",
+                    text="Заставка: имитация загрузки игры (до 10 секунд)",
                     foreground="#8a6414",
                 )
             elif phase == 1:
